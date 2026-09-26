@@ -29,7 +29,7 @@ Do not share these credentials publicly.
 
 ## 2. Install
 
-Python 3.11+ recommended.
+Python 3.11 is pinned in the included Dockerfile for Railway compatibility.
 
 ```bash
 python -m venv .venv
@@ -89,3 +89,12 @@ For a VPS:
 ## Scope
 
 This project is deliberately limited to publicly discoverable information and does not attempt to enumerate private groups or evade Telegram access controls.
+
+
+## Railway deployment
+
+This project includes a Railway-compatible `Dockerfile` pinned to Python 3.11 and `railway.json`.
+In Railway, deploy the project and add these Variables: `BOT_TOKEN`, `API_ID`, `API_HASH`, and `ADMIN_IDS`.
+The SQLite database and Telethon session are stored under `/app/data`. Attach a Railway Volume mounted at `/app/data` if you want the database and Telegram login session to survive redeploys.
+
+The bot uses the same asyncio loop for python-telegram-bot and Telethon and disables automatic loop closing during `run_polling`, which avoids the common `RuntimeError: Event loop is closed` shutdown crash on Railway.

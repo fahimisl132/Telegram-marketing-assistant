@@ -39,6 +39,7 @@ DB_PATH = os.getenv("DB_PATH", "finder.db")
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "20"))
 SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT_PER_QUERY", "50"))
 POST_SAMPLE_LIMIT = int(os.getenv("POST_SAMPLE_LIMIT", "12"))
+SESSION_PATH = os.getenv("SESSION_PATH", "/app/data/finder")
 
 ADMIN_IDS = {
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",")
@@ -437,7 +438,7 @@ def escape_html(s: str) -> str:
     )
 
 async def post_init(application: Application):
-    client = TelegramClient("finder", API_ID, API_HASH)
+    client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
     await client.start()
     application.bot_data["client"] = client
     log.info("Telegram user session authorized.")
@@ -464,7 +465,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Keep the asyncio event loop alive after PTB shutdown so Telethon can
+    # finish its reconnect/background tasks cleanly on Railway.
+    app.run_polling(allowed_updates=Update.ALL_TYPES, close_loop=False)
 
 if __name__ == "__main__":
     main()
