@@ -1,204 +1,470 @@
-import os, json, sqlite3, hashlib, logging
-from datetime import datetime, timezone
-import httpx
+import os
+import re
+import asyncio
+import logging
+import sqlite3
+from dataclasses import dataclass
+from typing import Optional
+
+from dotenv import load_dotenv
+from rapidfuzz import fuzz
+from telethon import TelegramClient, functions, types
+from telethon.tl.types import (
+    InputPeerEmpty,
+    InputMessagesFilterEmpty,
+    Channel,
+    Chat,
+)
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-BOT_TOKEN=os.environ["BOT_TOKEN"]; OWNER_ID=int(os.environ["OWNER_ID"])
-DB_PATH=os.getenv("DB_PATH","compliance_bot.sqlite3")
-AI_ENABLED=os.getenv("AI_ENABLED","true").lower() in {"1","true","yes","on"}
-AI_BASE_URL=os.getenv("AI_BASE_URL","https://api.openai.com/v1")
-AI_API_KEY=os.getenv("AI_API_KEY",""); AI_MODEL=os.getenv("AI_MODEL","gpt-5.6-mini")
-MAX_TEXT=8000; MAX_RULES=20000
+load_dotenv()
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("group-finder")
 
-def now(): return datetime.now(timezone.utc).isoformat()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "").strip()
+DB_PATH = os.getenv("DB_PATH", "finder.db")
+MAX_RESULTS = int(os.getenv("MAX_RESULTS", "20"))
+SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT_PER_QUERY", "50"))
+POST_SAMPLE_LIMIT = int(os.getenv("POST_SAMPLE_LIMIT", "12"))
+
+ADMIN_IDS = {
+    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+
+COUNTRIES = {
+    "BD": ("🇧🇩", "Bangladesh", ["bangladesh", "bd", "বাংলাদেশ", "bangla", "ঢাকা", "dhaka"]),
+    "IN": ("🇮🇳", "India", ["india", "indian", "in", "ভারত", "hindi", "delhi", "mumbai"]),
+    "PK": ("🇵🇰", "Pakistan", ["pakistan", "pakistani", "pk", "پاکستان", "urdu", "lahore", "karachi"]),
+    "US": ("🇺🇸", "United States", ["united states", "usa", "us", "american", "america", "new york", "california"]),
+    "GB": ("🇬🇧", "United Kingdom", ["united kingdom", "uk", "britain", "british", "england", "london"]),
+    "AE": ("🇦🇪", "United Arab Emirates", ["uae", "united arab emirates", "dubai", "abu dhabi", "emirates", "الإمارات"]),
+    "SA": ("🇸🇦", "Saudi Arabia", ["saudi", "saudi arabia", "ksa", "riyadh", "jeddah", "السعودية"]),
+    "MY": ("🇲🇾", "Malaysia", ["malaysia", "malaysian", "kuala lumpur", "malay"]),
+    "SG": ("🇸🇬", "Singapore", ["singapore", "singaporean"]),
+    "CA": ("🇨🇦", "Canada", ["canada", "canadian", "toronto", "vancouver"]),
+    "AU": ("🇦🇺", "Australia", ["australia", "australian", "sydney", "melbourne"]),
+    "OTHER": ("🌍", "Other / custom", []),
+}
+
+# Useful country-language hints. These are heuristic only.
+LANG_HINTS = {
+    "BD": ["বাংলা", "bangla", "bengali"],
+    "IN": ["hindi", "हिंदी", "tamil", "telugu", "marathi", "bengali", "english"],
+    "PK": ["urdu", "پنجابی", "pashto", "sindhi"],
+    "AE": ["arabic", "عربي", "english"],
+    "SA": ["arabic", "عربي"],
+    "MY": ["malay", "bahasa melayu"],
+}
+
 def db():
-    c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row; return c
-def init_db():
-    c=db(); c.executescript("""
-    CREATE TABLE IF NOT EXISTS chats(
-      chat_id TEXT PRIMARY KEY,title TEXT,username TEXT,chat_type TEXT,
-      description TEXT,pinned_text TEXT,rules_text TEXT,created_at TEXT,updated_at TEXT);
-    CREATE TABLE IF NOT EXISTS drafts(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,owner_id INTEGER,chat_id TEXT,original_text TEXT,
-      decision TEXT,modified_text TEXT,reasons TEXT,created_at TEXT);
-    CREATE TABLE IF NOT EXISTS audit(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,owner_id INTEGER,action TEXT,chat_id TEXT,
-      details TEXT,created_at TEXT);
-    """); c.commit(); c.close()
-def owner(u): return bool(u.effective_user and u.effective_user.id==OWNER_ID)
-async def guard(u):
-    if owner(u): return True
-    if u.effective_message: await u.effective_message.reply_text("⛔ এই bot শুধু owner ব্যবহার করতে পারবেন।")
-    return False
-def audit(action,chat_id=None,details=""):
-    c=db(); c.execute("INSERT INTO audit(owner_id,action,chat_id,details,created_at) VALUES(?,?,?,?,?)",
-                      (OWNER_ID,action,str(chat_id) if chat_id is not None else None,details[:4000],now()))
-    c.commit(); c.close()
-def upsert(chat_id,title="",username="",typ="",description="",pinned=""):
-    c=db(); old=c.execute("SELECT rules_text FROM chats WHERE chat_id=?",(str(chat_id),)).fetchone()
-    rules=old["rules_text"] if old else ""
-    c.execute("""INSERT INTO chats VALUES(?,?,?,?,?,?,?,?,?)
-      ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,username=excluded.username,
-      chat_type=excluded.chat_type,description=excluded.description,pinned_text=excluded.pinned_text,
-      updated_at=excluded.updated_at""",
-      (str(chat_id),title,username,typ,description,pinned,rules,now(),now()))
-    c.commit(); c.close()
-def get(chat_id):
-    c=db(); r=c.execute("SELECT * FROM chats WHERE chat_id=?",(str(chat_id),)).fetchone(); c.close(); return r
-def rules(row):
-    if not row: return ""
-    a=[]
-    if row["rules_text"]: a.append("USER-PROVIDED RULES:\n"+row["rules_text"])
-    if row["pinned_text"]: a.append("PINNED MESSAGE:\n"+row["pinned_text"])
-    if row["description"]: a.append("CHAT DESCRIPTION:\n"+row["description"])
-    return "\n\n".join(a)
-def setrules(chat_id,text):
-    c=db(); c.execute("UPDATE chats SET rules_text=?,updated_at=? WHERE chat_id=?",
-                      (text[:MAX_RULES],now(),str(chat_id))); c.commit(); c.close()
-async def ai_json(system,user):
-    if not AI_ENABLED or not AI_API_KEY: raise RuntimeError("AI is not configured.")
-    async with httpx.AsyncClient(timeout=60) as x:
-        r=await x.post(AI_BASE_URL.rstrip("/")+"/chat/completions",
-          headers={"Authorization":"Bearer "+AI_API_KEY,"Content-Type":"application/json"},
-          json={"model":AI_MODEL,"temperature":0.1,"response_format":{"type":"json_object"},
-                "messages":[{"role":"system","content":system},{"role":"user","content":user}]})
-        r.raise_for_status(); return json.loads(r.json()["choices"][0]["message"]["content"])
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS groups (
+            id INTEGER PRIMARY KEY,
+            telegram_id INTEGER UNIQUE,
+            username TEXT,
+            title TEXT,
+            about TEXT,
+            country TEXT,
+            last_posts TEXT,
+            url TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.commit()
+    return con
 
-RULE_SYSTEM="""You are a conservative Telegram group-rules compliance analyst.
-Use ONLY the supplied group rules/source. Never invent rules. If rules are missing, vague,
-contradictory or insufficient, choose REVIEW.
-Return JSON only:
-{"decision":"APPROVE|REVIEW|BLOCK","confidence":0.0,"allowed_topics":[],
-"disallowed_topics":[],"reasons":[],"modified_text":"","changes":[]}
-APPROVE=appears compatible. BLOCK=clearly violates an explicit rule. REVIEW=uncertain.
-If a safe compliant rewrite is reasonably possible, put it in modified_text. Do not evade
-moderation or hide prohibited intent. Preserve factual intent where possible."""
-EXTRACT_SYSTEM="""Extract explicit group rules from supplied Telegram text.
-Never invent rules. Return JSON only:
-{"summary":"","allowed":[],"disallowed":[],"format_requirements":[],"language_requirements":[],
-"promotion_rules":[],"link_rules":[],"uncertainties":[]}"""
+def is_admin(uid: int) -> bool:
+    # If ADMIN_IDS is empty, refuse rather than accidentally exposing a utility bot.
+    return uid in ADMIN_IDS
 
-async def start(u,ctx):
-    if not await guard(u): return
-    await u.message.reply_text("👋 Rules Compliance Bot ready.\n\n/analyze <chat_id>\n/setrules <chat_id>\n/check <chat_id>\n/rewrite <chat_id>\n/rules <chat_id>\n/chats\n/status\n/logs [count]\n/cancel\n\nএটি নিজে third-party group-এ post করে না।")
-async def help_cmd(u,ctx):
-    if not await guard(u): return
-    await u.message.reply_text(
-      "/analyze <chat_id> — accessible chat info/description/pinned message নেয়\n"
-      "/setrules <chat_id> — পরের message-কে rules হিসেবে save করে\n"
-      "/rules <chat_id> — saved source দেখায়\n"
-      "/check <chat_id> — draft check\n"
-      "/rewrite <chat_id> — compliant rewrite চেষ্টা\n"
-      "/chats — saved chats\n/status — status\n/logs [count]\n/cancel\n\n"
-      "শুধু chat ID দিলেই private/complete group history পাওয়া যায় না; প্রয়োজন হলে rules paste/forward করতে হবে।")
-async def analyze(u,ctx):
-    if not await guard(u): return
-    if not ctx.args: return await u.message.reply_text("ব্যবহার: /analyze -1001234567890")
-    cid=ctx.args[0]
+def normalize(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").lower()).strip()
+
+def tokens(s: str):
+    # Keep Unicode words; remove punctuation.
+    return re.findall(r"[^\W_]+", normalize(s), flags=re.UNICODE)
+
+def country_score(text: str, code: str) -> float:
+    if code == "OTHER":
+        return 50.0
+    t = normalize(text)
+    terms = COUNTRIES[code][2]
+    hits = sum(1 for term in terms if term in t)
+    lang_hits = sum(1 for term in LANG_HINTS.get(code, []) if term in t)
+    if not hits and not lang_hits:
+        return 0.0
+    return min(100.0, hits * 28.0 + lang_hits * 12.0)
+
+def relevance(query: str, country_code: str, title: str, username: str, about: str, posts: str):
+    q = normalize(query)
+    fields = {
+        "name": normalize(title),
+        "username": normalize(username),
+        "description": normalize(about),
+        "posts": normalize(posts),
+    }
+    # Fuzzy semantic-ish lexical matching. This is intentionally transparent
+    # and does not claim to be an embedding/LLM probability.
+    name = fuzz.token_set_ratio(q, fields["name"]) if fields["name"] else 0
+    user = fuzz.token_set_ratio(q, fields["username"]) if fields["username"] else 0
+    desc = fuzz.token_set_ratio(q, fields["description"]) if fields["description"] else 0
+    post = fuzz.token_set_ratio(q, fields["posts"]) if fields["posts"] else 0
+
+    # Exact query-token coverage boosts results with matching words.
+    qt = set(tokens(q))
+    combined = " ".join(fields.values())
+    coverage = (sum(1 for x in qt if x in combined) / max(1, len(qt))) * 100
+
+    cscore = country_score(
+        " ".join([fields["name"], fields["username"], fields["description"], fields["posts"]]),
+        country_code,
+    )
+
+    # Country is a filter/ranking signal, not a guarantee.
+    score = (
+        name * 0.18 +
+        user * 0.08 +
+        desc * 0.24 +
+        post * 0.30 +
+        coverage * 0.10 +
+        cscore * 0.10
+    )
+    return round(min(100, score), 1), cscore
+
+def make_url(entity) -> Optional[str]:
+    username = getattr(entity, "username", None)
+    if username:
+        return f"https://t.me/{username}"
+    return None
+
+async def fetch_about(client, entity) -> str:
     try:
-        ch=await ctx.bot.get_chat(cid); p=getattr(ch,"pinned_message",None)
-        pt=(getattr(p,"text",None) or getattr(p,"caption",None) or "") if p else ""
-        upsert(ch.id,getattr(ch,"title","") or "",getattr(ch,"username","") or "",
-               getattr(ch,"type","") or "",getattr(ch,"description","") or "",pt)
-        src=rules(get(ch.id))
-        if not src:
-            return await u.message.reply_text(f"✅ Chat found: {ch.title or ch.id}\n\nRules source পাওয়া যায়নি। /setrules {ch.id} ব্যবহার করো।")
-        if not AI_ENABLED or not AI_API_KEY:
-            return await u.message.reply_text("✅ Source saved.\n\n"+src[:6000]+"\n\nAI configure করলে structured analysis পাওয়া যাবে।")
-        res=await ai_json(EXTRACT_SYSTEM,src[:MAX_RULES])
-        out=(f"🔎 <b>{ch.title or ch.id}</b>\n\n<b>Summary:</b> {res.get('summary','')}\n\n"
-             f"✅ <b>Allowed:</b>\n"+"\n".join("• "+x for x in res.get("allowed",[]))+
-             "\n\n❌ <b>Disallowed:</b>\n"+"\n".join("• "+x for x in res.get("disallowed",[]))+
-             "\n\n📝 <b>Format:</b>\n"+"\n".join("• "+x for x in res.get("format_requirements",[]))+
-             "\n\n🌐 <b>Language:</b>\n"+"\n".join("• "+x for x in res.get("language_requirements",[]))+
-             "\n\n📢 <b>Promotion:</b>\n"+"\n".join("• "+x for x in res.get("promotion_rules",[]))+
-             "\n\n🔗 <b>Links:</b>\n"+"\n".join("• "+x for x in res.get("link_rules",[]))+
-             "\n\n⚠️ <b>Uncertainties:</b>\n"+"\n".join("• "+x for x in res.get("uncertainties",[])))
-        await u.message.reply_text(out,parse_mode="HTML"); audit("analyze",ch.id,src[:1000])
+        if isinstance(entity, Channel):
+            full = await client(functions.channels.GetFullChannelRequest(entity))
+            return getattr(full.full_chat, "about", "") or ""
+        if isinstance(entity, Chat):
+            full = await client(functions.messages.GetFullChatRequest(entity.id))
+            return getattr(full.full_chat, "about", "") or ""
     except Exception as e:
-        await u.message.reply_text("❌ Chat info পাওয়া যায়নি। Bot-এর access/ID যাচাই করো।\n\n"+str(e))
-async def setrules_cmd(u,ctx):
-    if not await guard(u): return
-    if not ctx.args: return await u.message.reply_text("ব্যবহার: /setrules <chat_id>")
-    cid=ctx.args[0]
-    if not get(cid): upsert(cid)
-    ctx.user_data.update(mode="setrules",chat_id=cid)
-    await u.message.reply_text(f"📥 এখন {cid}-এর rules paste বা forward করো। /cancel দিয়ে বাতিল।")
-async def rules_cmd(u,ctx):
-    if not await guard(u): return
-    if not ctx.args: return await u.message.reply_text("ব্যবহার: /rules <chat_id>")
-    r=get(ctx.args[0]); await u.message.reply_text((rules(r) if r else "কিছু নেই।")[:10000])
-async def check_cmd(u,ctx):
-    if not await guard(u): return
-    if not ctx.args: return await u.message.reply_text("ব্যবহার: /check <chat_id>")
-    cid=ctx.args[0]
-    if not get(cid) or not rules(get(cid)): return await u.message.reply_text("❌ Rules নেই। আগে /analyze বা /setrules করো।")
-    ctx.user_data.update(mode="check",chat_id=cid); await u.message.reply_text("📝 এখন draft message পাঠাও।")
-async def rewrite_cmd(u,ctx):
-    if not await guard(u): return
-    if not ctx.args: return await u.message.reply_text("ব্যবহার: /rewrite <chat_id>")
-    cid=ctx.args[0]
-    if not get(cid) or not rules(get(cid)): return await u.message.reply_text("❌ Rules নেই। আগে /setrules করো।")
-    ctx.user_data.update(mode="rewrite",chat_id=cid); await u.message.reply_text("✏️ Draft পাঠাও।")
-async def process(u,ctx,text):
-    if not await guard(u): return
-    mode=ctx.user_data.get("mode"); cid=ctx.user_data.get("chat_id"); ctx.user_data.clear()
-    if not mode or not cid: return await u.message.reply_text("প্রথমে /check বা /rewrite বা /setrules ব্যবহার করো।")
-    if mode=="setrules":
-        setrules(cid,text); audit("set_rules",cid,text[:1000]); return await u.message.reply_text("✅ Rules saved.")
-    rr=rules(get(cid))
-    if len(text)>MAX_TEXT: return await u.message.reply_text(f"❌ সর্বোচ্চ {MAX_TEXT} characters.")
+        log.debug("about lookup failed: %s", e)
+    return ""
+
+async def sample_posts(client, entity, limit=POST_SAMPLE_LIMIT) -> str:
+    texts = []
     try:
-        res=await ai_json(RULE_SYSTEM,f"GROUP ID: {cid}\n\nGROUP RULES/SOURCE:\n{rr[:MAX_RULES]}\n\nPROPOSED MESSAGE:\n{text}")
-        dec=str(res.get("decision","REVIEW")).upper()
-        if dec not in {"APPROVE","REVIEW","BLOCK"}: dec="REVIEW"
-        mod=(res.get("modified_text") or "").strip(); reasons=res.get("reasons",[]); changes=res.get("changes",[])
-        c=db(); cur=c.execute("INSERT INTO drafts(owner_id,chat_id,original_text,decision,modified_text,reasons,created_at) VALUES(?,?,?,?,?,?,?)",
-          (OWNER_ID,str(cid),text,dec,mod,json.dumps(reasons,ensure_ascii=False),now())); did=cur.lastrowid; c.commit(); c.close()
-        icon={"APPROVE":"✅","REVIEW":"⚠️","BLOCK":"❌"}[dec]
-        out=f"{icon} <b>{dec}</b>\nDraft ID: <code>{did}</code>\n\n<b>Reasons:</b>\n"+("\n".join("• "+str(x) for x in reasons) or "• None")
-        out+="\n\n<b>Changes:</b>\n"+("\n".join("• "+str(x) for x in changes) or "• None")
-        if mod: out+="\n\n✏️ <b>Suggested version:</b>\n"+mod
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Copy suggested text",callback_data=f"copy:{did}")],
-                                 [InlineKeyboardButton("🗑 Delete result",callback_data=f"delete:{did}")]])
-        await u.message.reply_text(out,parse_mode="HTML",reply_markup=kb)
-        audit("check" if mode=="check" else "rewrite",cid,dec)
+        # Publicly readable messages only.
+        async for msg in client.iter_messages(entity, limit=limit):
+            if msg and getattr(msg, "message", None):
+                texts.append(msg.message[:1200])
     except Exception as e:
-        await u.message.reply_text("❌ AI check failed: "+str(e))
-async def text_msg(u,ctx):
-    if u.effective_message and u.effective_message.text: await process(u,ctx,u.effective_message.text)
-async def callback(u,ctx):
-    q=u.callback_query
-    if q.from_user.id!=OWNER_ID: return await q.answer("Not allowed",show_alert=True)
-    await q.answer(); a,i=q.data.split(":")
-    if a=="delete": return await q.edit_message_text("🗑 Result removed.")
-    c=db(); r=c.execute("SELECT modified_text FROM drafts WHERE id=? AND owner_id=?",(int(i),OWNER_ID)).fetchone(); c.close()
-    await q.message.reply_text(r["modified_text"] if r and r["modified_text"] else "Suggested rewrite নেই।")
-async def chats(u,ctx):
-    if not await guard(u): return
-    c=db(); rs=c.execute("SELECT chat_id,title,chat_type FROM chats ORDER BY updated_at DESC").fetchall(); c.close()
-    await u.message.reply_text("\n".join(f"• {r['chat_id']} | {r['title'] or '-'} | {r['chat_type'] or '-'}" for r in rs)[:10000] or "No saved chats.")
-async def status(u,ctx):
-    if not await guard(u): return
-    c=db(); a=c.execute("SELECT COUNT(*) n FROM chats").fetchone()["n"]; d=c.execute("SELECT COUNT(*) n FROM drafts").fetchone()["n"]; c.close()
-    await u.message.reply_text(f"🤖 Compliance Bot\nAI: {'ON' if AI_ENABLED and AI_API_KEY else 'OFF'}\nSaved chats: {a}\nChecked drafts: {d}\nAuto-posting: OFF")
-async def logs(u,ctx):
-    if not await guard(u): return
-    n=min(max(int(ctx.args[0]) if ctx.args and ctx.args[0].isdigit() else 20,1),100)
-    c=db(); rs=c.execute("SELECT action,chat_id,details,created_at FROM audit ORDER BY id DESC LIMIT ?",(n,)).fetchall(); c.close()
-    await u.message.reply_text("\n".join(f"{r['created_at']} | {r['action']} | {r['chat_id'] or '-'} | {r['details'][:100]}" for r in rs)[:10000] or "No logs.")
-async def cancel(u,ctx):
-    if not await guard(u): return
-    ctx.user_data.clear(); await u.message.reply_text("✅ Cancelled.")
+        log.debug("post lookup failed: %s", e)
+    return "\n".join(texts)
+
+async def global_search(client, query: str, limit: int = SEARCH_LIMIT):
+    # Telegram's global search returns messages plus related chats.
+    result = await client(functions.messages.SearchGlobalRequest(
+        q=query,
+        filter=InputMessagesFilterEmpty(),
+        min_date=None,
+        max_date=None,
+        offset_id=0,
+        offset_rate=0,
+        offset_peer=InputPeerEmpty(),
+        limit=limit,
+    ))
+    entities = {}
+    for chat in getattr(result, "chats", []):
+        if isinstance(chat, (Channel, Chat)):
+            entities[chat.id] = chat
+    for msg in getattr(result, "messages", []):
+        peer_id = getattr(msg, "peer_id", None)
+        if peer_id is not None:
+            cid = getattr(peer_id, "channel_id", None) or getattr(peer_id, "chat_id", None)
+            if cid is not None and cid not in entities:
+                try:
+                    ent = await client.get_entity(peer_id)
+                    if isinstance(ent, (Channel, Chat)):
+                        entities[cid] = ent
+                except Exception:
+                    pass
+    return list(entities.values())
+
+async def discover(client, query: str, country_code: str):
+    # Multiple query variants improve recall without pretending to enumerate all Telegram.
+    country_terms = []
+    if country_code != "OTHER":
+        country_terms = COUNTRIES[country_code][2][:4]
+
+    queries = [query]
+    if country_terms:
+        # Search both user wording and country-qualified wording.
+        queries.extend([f"{query} {country_terms[0]}", f"{country_terms[0]} {query}"])
+    queries = list(dict.fromkeys(queries))
+
+    found = {}
+    for q in queries:
+        try:
+            ents = await global_search(client, q)
+            for ent in ents:
+                uid = getattr(ent, "id", None)
+                if uid is not None:
+                    found[uid] = ent
+        except Exception as e:
+            log.warning("search failed for %r: %s", q, e)
+        await asyncio.sleep(0.5)
+
+    rows = []
+    for ent in found.values():
+        title = getattr(ent, "title", "") or ""
+        username = getattr(ent, "username", "") or ""
+        # Ignore broadcast channels unless the user explicitly wants channels.
+        if isinstance(ent, Channel) and getattr(ent, "broadcast", False):
+            continue
+
+        about = await fetch_about(client, ent)
+        posts = await sample_posts(client, ent)
+        score, cscore = relevance(query, country_code, title, username, about, posts)
+
+        # Country filter: keep strong country evidence, but allow semantically
+        # strong results because Telegram has no authoritative country metadata.
+        if country_code != "OTHER" and cscore < 10 and score < 62:
+            continue
+
+        url = make_url(ent)
+        if not url:
+            continue
+
+        rows.append({
+            "telegram_id": int(getattr(ent, "id")),
+            "title": title,
+            "username": username,
+            "about": about,
+            "posts": posts,
+            "url": url,
+            "score": score,
+            "country_score": cscore,
+        })
+
+    rows.sort(key=lambda x: (-x["score"], -x["country_score"], x["title"].lower()))
+    return rows[:MAX_RESULTS]
+
+def save_rows(rows, country_code):
+    con = db()
+    for r in rows:
+        con.execute("""
+            INSERT INTO groups(telegram_id, username, title, about, country, last_posts, url)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+              username=excluded.username,
+              title=excluded.title,
+              about=excluded.about,
+              country=excluded.country,
+              last_posts=excluded.last_posts,
+              url=excluded.url,
+              updated_at=CURRENT_TIMESTAMP
+        """, (
+            r["telegram_id"], r["username"], r["title"], r["about"],
+            country_code, r["posts"], r["url"]
+        ))
+    con.commit()
+    con.close()
+
+@dataclass
+class UserState:
+    country: str = "OTHER"
+    waiting_query: bool = False
+
+STATES = {}
+
+def country_keyboard():
+    rows = []
+    current = list(COUNTRIES.items())
+    for i in range(0, len(current), 2):
+        row = []
+        for code, (flag, name, _) in current[i:i+2]:
+            row.append(InlineKeyboardButton(f"{flag} {name}", callback_data=f"country:{code}"))
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+def menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Search groups", callback_data="search")],
+        [InlineKeyboardButton("🌍 Change country", callback_data="country_menu")],
+    ])
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("This bot is restricted to its configured admin user(s).")
+        return
+    STATES[uid] = UserState()
+    await update.message.reply_text(
+        "Telegram Public Group Finder\n\nChoose a country first, then describe the groups you want.",
+        reply_markup=menu_keyboard(),
+    )
+
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if not is_admin(uid):
+        return
+
+    state = STATES.setdefault(uid, UserState())
+
+    if q.data == "country_menu":
+        await q.edit_message_text("🌍 Select country:", reply_markup=country_keyboard())
+        return
+
+    if q.data == "search":
+        state.waiting_query = True
+        country = COUNTRIES[state.country]
+        await q.edit_message_text(
+            f"{country[0]} {country[1]} selected.\n\n"
+            "Now send what kind of public groups you want.\n"
+            "Example: `freelancing and remote jobs for Bangladesh`"
+        )
+        return
+
+    if q.data.startswith("country:"):
+        code = q.data.split(":", 1)[1]
+        if code in COUNTRIES:
+            state.country = code
+            state.waiting_query = True
+            flag, name, _ = COUNTRIES[code]
+            await q.edit_message_text(
+                f"{flag} {name} selected.\n\n"
+                "Send the type/topic of public groups you want to find."
+            )
+
+async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+
+    state = STATES.setdefault(uid, UserState())
+    if not state.waiting_query:
+        await update.message.reply_text("Press Search groups first.", reply_markup=menu_keyboard())
+        return
+
+    query = (update.message.text or "").strip()
+    if len(query) < 2:
+        await update.message.reply_text("Please enter a more specific search.")
+        return
+
+    state.waiting_query = False
+    flag, cname, _ = COUNTRIES[state.country]
+    status = await update.message.reply_text(
+        f"🔎 Searching public Telegram results...\n"
+        f"{flag} Country: {cname}\n"
+        f"📝 Query: {query}\n\n"
+        "This can take a little while because public descriptions and recent public posts are checked."
+    )
+
+    client = context.application.bot_data["client"]
+    try:
+        rows = await discover(client, query, state.country)
+        save_rows(rows, state.country)
+    except Exception as e:
+        log.exception("discovery failed")
+        await status.edit_text(
+            "Search failed. Check that the Telegram user session is authorized and try again."
+        )
+        return
+
+    if not rows:
+        await status.edit_text(
+            "No sufficiently relevant public groups were found for that country/query.\n\n"
+            "Try broader keywords or another country."
+        )
+        return
+
+    chunks = []
+    for i, r in enumerate(rows, 1):
+        about = re.sub(r"\s+", " ", r["about"]).strip()
+        if len(about) > 180:
+            about = about[:177] + "..."
+        post_preview = re.sub(r"\s+", " ", r["posts"]).strip()
+        post_preview = post_preview[:140] + ("..." if len(post_preview) > 140 else "")
+        username = f"@{r['username']}" if r["username"] else "(no public username)"
+
+        chunks.append(
+            f"{i}. <b>{escape_html(r['title'])}</b>\n"
+            f"👤 {escape_html(username)}\n"
+            f"🎯 Relevance: <b>{r['score']}%</b>\n"
+            f"📝 {escape_html(about or 'No public description')}\n"
+            f"📢 Post match: {escape_html(post_preview or 'No readable recent public post sample')}\n"
+            f"🔗 <a href=\"{r['url']}\">Open group</a>"
+        )
+
+    # Telegram message size is limited; split output safely.
+    header = f"{flag} <b>{escape_html(cname)}</b> — {len(rows)} public group result(s)\n\n"
+    current = header
+    for item in chunks:
+        if len(current) + len(item) + 2 > 3900:
+            await update.message.reply_text(current, parse_mode="HTML", disable_web_page_preview=True)
+            current = ""
+        current += item + "\n\n"
+    if current:
+        await update.message.reply_text(current, parse_mode="HTML", disable_web_page_preview=True)
+
+    await update.message.reply_text(
+        "Search finished. Scores are program-generated relevance estimates, not Telegram ratings.",
+        reply_markup=menu_keyboard(),
+    )
+
+def escape_html(s: str) -> str:
+    return (
+        str(s).replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+async def post_init(application: Application):
+    client = TelegramClient("finder", API_ID, API_HASH)
+    await client.start()
+    application.bot_data["client"] = client
+    log.info("Telegram user session authorized.")
+
+async def post_shutdown(application: Application):
+    client = application.bot_data.get("client")
+    if client:
+        await client.disconnect()
+
 def main():
-    init_db(); app=Application.builder().token(BOT_TOKEN).build()
-    for name,fn in [("start",start),("help",help_cmd),("analyze",analyze),("setrules",setrules_cmd),
-                    ("rules",rules_cmd),("check",check_cmd),("rewrite",rewrite_cmd),("chats",chats),
-                    ("status",status),("logs",logs),("cancel",cancel)]:
-        app.add_handler(CommandHandler(name,fn))
-    app.add_handler(CallbackQueryHandler(callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,text_msg))
+    if not BOT_TOKEN or not API_ID or not API_HASH:
+        raise SystemExit("Set BOT_TOKEN, API_ID and API_HASH in .env")
+    if not ADMIN_IDS:
+        raise SystemExit("Set ADMIN_IDS in .env")
+
+    db().close()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(buttons))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-if __name__=="__main__": main()
+
+if __name__ == "__main__":
+    main()
