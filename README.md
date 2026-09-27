@@ -1,46 +1,27 @@
-# Telegram Group Finder — Railway package
-
-This package is prepared for Railway using a Dockerfile pinned to Python 3.11.
+# Telegram Public Group Finder — Railway verified
 
 ## Railway variables
+Set:
+- `BOT_TOKEN`
+- `API_ID`
+- `API_HASH`
+- `ADMIN_IDS`
 
-Add these Variables to the Railway service:
+Optional: `TG_STRING_SESSION` if you already have a Telethon StringSession.
 
-- `BOT_TOKEN` — token from @BotFather
-- `API_ID` — Telegram API ID from https://my.telegram.org
-- `API_HASH` — Telegram API hash from https://my.telegram.org
-- `ADMIN_IDS` — your Telegram numeric user ID (or comma-separated IDs)
+## First run on Railway
+This build NEVER calls Telethon `client.start()` interactively, so it will not crash with `EOFError: EOF when reading a line`.
 
-Optional:
-- `MAX_RESULTS`
-- `SEARCH_LIMIT_PER_QUERY`
-- `POST_SAMPLE_LIMIT`
+1. Deploy the service.
+2. Open the bot as the admin account.
+3. Send `/login`.
+4. Send the Telegram phone number, then the Telegram login code.
+5. If 2-step verification is enabled, send the Telegram 2FA password.
+6. The Telethon SQLite session is saved under `/app/data/finder.session`.
 
-## Important: Telegram user session
+For persistence across redeploys/restarts, attach a Railway Volume mounted at `/app/data`.
 
-The global/public Telegram search uses a Telethon user session. On the first run, Telethon needs to log in to a Telegram user account and create `/app/data/finder.session`.
-
-For reliable production use on Railway, attach a Railway Volume and mount it at:
-
-`/app/data`
-
-This preserves the SQLite database and Telegram session across redeploys/restarts.
-
-Do not share the generated `.session` file or API credentials.
-
-## Railway deployment
-
-1. Upload/deploy this package as the project source.
-2. Make sure the service uses the included `Dockerfile` (the included `railway.json` explicitly selects it).
-3. Add the four required Variables.
-4. Deploy.
-5. On the first run, complete the Telethon user-account login when prompted by the runtime environment. After `finder.session` is created, keep `/app/data` on a Railway Volume.
-
-## What this fixes
-
-- Python is pinned to 3.11 instead of 3.13.
-- `/app/data` is created before SQLite or Telethon opens files.
-- The container startup script creates `/app/data` on every start.
-- The Telegram bot and Telethon client share the same asyncio loop; `run_polling(close_loop=False)` avoids the common event-loop shutdown error.
-
-The bot only uses publicly discoverable Telegram information and does not bypass private-group permissions.
+## Important
+- The Telegram user session is used only for public Telegram search/read access.
+- Private groups are not bypassed.
+- Country matching is heuristic; Telegram does not provide an authoritative group-country field.

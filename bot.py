@@ -10,6 +10,8 @@ from typing import Optional
 from dotenv import load_dotenv
 from rapidfuzz import fuzz
 from telethon import TelegramClient, functions, types
+from telethon.sessions import StringSession
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneNumberInvalidError
 from telethon.tl.types import (
     InputPeerEmpty,
     InputMessagesFilterEmpty,
@@ -41,6 +43,7 @@ MAX_RESULTS = int(os.getenv("MAX_RESULTS", "20"))
 SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT_PER_QUERY", "50"))
 POST_SAMPLE_LIMIT = int(os.getenv("POST_SAMPLE_LIMIT", "12"))
 SESSION_PATH = os.getenv("SESSION_PATH", "/app/data/finder")
+TG_STRING_SESSION = os.getenv("TG_STRING_SESSION", "").strip()
 
 # Railway containers may start without the data directory. Create parent folders
 # before SQLite/Telethon try to open their files.
@@ -298,6 +301,7 @@ class UserState:
     waiting_query: bool = False
 
 STATES = {}
+LOGIN_STATES = {}
 
 def country_keyboard():
     rows = []
@@ -321,10 +325,75 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("This bot is restricted to its configured admin user(s).")
         return
     STATES[uid] = UserState()
+    client = context.application.bot_data.get("client")
+    authorized = bool(client and await client.is_user_authorized())
+    auth_note = "\n\n✅ Telegram search session is ready." if authorized else "\n\n⚠️ Telegram search session is not authorized yet. Send /login once to connect your Telegram account."
     await update.message.reply_text(
-        "Telegram Public Group Finder\n\nChoose a country first, then describe the groups you want.",
+        "Telegram Public Group Finder\n\nChoose a country first, then describe the groups you want." + auth_note,
         reply_markup=menu_keyboard(),
     )
+
+async def login_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    client = context.application.bot_data.get("client")
+    if not client:
+        await update.message.reply_text("Telegram client is not ready yet. Try again in a few seconds.")
+        return
+    if await client.is_user_authorized():
+        await update.message.reply_text("✅ Telegram user session is already authorized.")
+        return
+    LOGIN_STATES[uid] = {"step": "phone"}
+    await update.message.reply_text(
+        "🔐 Telegram login\n\nSend the phone number of the Telegram account you want this bot to use, including country code.\nExample: +8801XXXXXXXXX"
+    )
+
+async def handle_login_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    uid = update.effective_user.id
+    state = LOGIN_STATES.get(uid)
+    if not state or not is_admin(uid):
+        return False
+    text = (update.message.text or "").strip()
+    client = context.application.bot_data.get("client")
+    if not client:
+        await update.message.reply_text("Telegram client is not ready. Try /login again.")
+        LOGIN_STATES.pop(uid, None)
+        return True
+
+    try:
+        if state["step"] == "phone":
+            await client.send_code_request(text)
+            state["phone"] = text
+            state["step"] = "code"
+            await update.message.reply_text("📩 Telegram sent a login code. Send the code here (example: 12345).")
+            return True
+
+        if state["step"] == "code":
+            await client.sign_in(phone=state["phone"], code=text)
+            LOGIN_STATES.pop(uid, None)
+            await update.message.reply_text("✅ Telegram account connected successfully. You can now search groups.", reply_markup=menu_keyboard())
+            return True
+
+        if state["step"] == "password":
+            await client.sign_in(password=text)
+            LOGIN_STATES.pop(uid, None)
+            await update.message.reply_text("✅ Two-step verification accepted. Telegram account connected.", reply_markup=menu_keyboard())
+            return True
+    except SessionPasswordNeededError:
+        state["step"] = "password"
+        await update.message.reply_text("🔑 This Telegram account has 2-step verification. Send your Telegram 2FA password here.")
+        return True
+    except (PhoneCodeInvalidError, PhoneNumberInvalidError) as e:
+        await update.message.reply_text(f"❌ Telegram login failed: {e}. Send /login to restart.")
+        LOGIN_STATES.pop(uid, None)
+        return True
+    except Exception as e:
+        log.exception("telegram login failed")
+        await update.message.reply_text("❌ Telegram login failed. Send /login to restart.")
+        LOGIN_STATES.pop(uid, None)
+        return True
+    return False
 
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -363,6 +432,9 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
+        return
+
+    if await handle_login_text(update, context):
         return
 
     state = STATES.setdefault(uid, UserState())
@@ -445,10 +517,15 @@ def escape_html(s: str) -> str:
     )
 
 async def post_init(application: Application):
-    client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
-    await client.start()
+    # Never call Telethon's client.start() on Railway: it uses interactive
+    # input(), which has no stdin in a hosted service and causes EOFError.
+    # Instead, connect non-interactively and use /login if the session is new.
+    session = StringSession(TG_STRING_SESSION) if TG_STRING_SESSION else SESSION_PATH
+    client = TelegramClient(session, API_ID, API_HASH)
+    await client.connect()
     application.bot_data["client"] = client
-    log.info("Telegram user session authorized.")
+    authorized = await client.is_user_authorized()
+    log.info("Telegram user session connected; authorized=%s", authorized)
 
 async def post_shutdown(application: Application):
     client = application.bot_data.get("client")
@@ -470,6 +547,7 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("login", login_cmd))
     app.add_handler(CallbackQueryHandler(buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     # Keep the asyncio event loop alive after PTB shutdown so Telethon can
