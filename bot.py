@@ -3,6 +3,7 @@ import re
 import asyncio
 import logging
 import sqlite3
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
@@ -35,11 +36,16 @@ log = logging.getLogger("group-finder")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
-DB_PATH = os.getenv("DB_PATH", "finder.db")
+DB_PATH = os.getenv("DB_PATH", "/app/data/finder.db")
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "20"))
 SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT_PER_QUERY", "50"))
 POST_SAMPLE_LIMIT = int(os.getenv("POST_SAMPLE_LIMIT", "12"))
 SESSION_PATH = os.getenv("SESSION_PATH", "/app/data/finder")
+
+# Railway containers may start without the data directory. Create parent folders
+# before SQLite/Telethon try to open their files.
+Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+Path(SESSION_PATH).parent.mkdir(parents=True, exist_ok=True)
 
 ADMIN_IDS = {
     int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",")
@@ -72,6 +78,7 @@ LANG_HINTS = {
 }
 
 def db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("""
         CREATE TABLE IF NOT EXISTS groups (
