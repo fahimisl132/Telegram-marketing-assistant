@@ -1,4 +1,0 @@
-python-telegram-bot>=22.0,<23
-telethon>=1.42,<2
-python-dotenv>=1.0,<2
-rapidfuzz>=3.0,<4
